@@ -5,6 +5,7 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
+from semeio.jobs.rft.utility import load_and_parse_well_time_file
 
 import subscript
 
@@ -60,6 +61,15 @@ def get_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("obsdir", type=str, help="Directory with ERT observation data")
+    parser.add_argument(
+        "--welldatefile",
+        type=str,
+        default="well_date_rft.txt",
+        help=(
+            "File with date and report step information for rft-wells. "
+            "Required if any well has more than one report_step"
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Be verbose")
     parser.add_argument(
         "-o", "--output", type=str, default="rft_ertobs_sim.csv", help="Output CSV file"
@@ -110,6 +120,17 @@ def split_wellname_reportstep(wellname_reportstep: str) -> Tuple[str, int]:
         return ("_".join(components), 1)
 
 
+def get_report_step_dates(welldatefile: Path) -> pd.DataFrame:
+    """
+    Function to parse the well_data_file and return a dataframe
+    with well, time and report_step information
+    """
+    return pd.DataFrame(
+        load_and_parse_well_time_file(welldatefile),
+        columns=["well", "time", "report_step"],
+    ).astype({"time": "str"})
+
+
 def get_observations(obsdir: str = "", filepattern: str = "*.obs") -> pd.DataFrame:
     """
     Gather observation data from a directory of input filenames, or later
@@ -129,12 +150,14 @@ def get_observations(obsdir: str = "", filepattern: str = "*.obs") -> pd.DataFra
 
     order
         order of measurements as they appeared in the obsfile.
-    obs
+    observed
         observed pressure
     error
         assumed pressure error
     well
         name of well, deduced from filenames.
+    report_step
+        report step for date
 
     Column names are made to match Webviz RFT plotter,
 
@@ -193,7 +216,9 @@ def get_observations(obsdir: str = "", filepattern: str = "*.obs") -> pd.DataFra
     return pd.DataFrame()
 
 
-def merge_rft_ertobs(gendatacsv: str, obsdir: str) -> pd.DataFrame:
+def merge_rft_ertobs(
+    gendatacsv: str, obsdir: str, welldatefile: str = "well_date_rft.txt"
+) -> pd.DataFrame:
     """Main function for merge_rft_ertobs named arguments.
 
     Arguments correspond to argparse documentation
@@ -221,7 +246,26 @@ def merge_rft_ertobs(gendatacsv: str, obsdir: str) -> pd.DataFrame:
     # For each simulated well, look up
     logger.info("Parsed %s observations from files in %s", str(len(obs_df)), obsdir)
 
-    return pd.merge(sim_df, obs_df, how="left", on=["well", "order"])
+    merge_on_columns = ["well", "order"]
+    # if any wells have more than one report_step the time needs to be merged on as well
+    if any(
+        wellobsdf["report_step"].nunique() > 1
+        for well, wellobsdf in obs_df.groupby("well")
+    ):
+        datefile = Path(obsdir) / welldatefile
+        if not datefile.is_file():
+            raise ValueError(
+                f"Could not find welldatefile {datefile}, this file is needed for "
+                "cases with more than one report_step"
+            )
+        # merge in date from welldatefile
+        dates_df = get_report_step_dates(datefile)
+        obs_df = pd.merge(obs_df, dates_df, how="left", on=["well", "report_step"])
+        merge_on_columns.append("time")
+
+    rft_ert_df = pd.merge(sim_df, obs_df, how="left", on=merge_on_columns)
+    # remove observations for dates (report steps) where there is no data.
+    return rft_ert_df[rft_ert_df["observed"] != -1]
 
 
 def main() -> None:
@@ -235,7 +279,11 @@ def main() -> None:
     if args.verbose:
         logger.setLevel(logging.INFO)
 
-    dframe = merge_rft_ertobs(gendatacsv=args.gendatacsv, obsdir=args.obsdir)
+    dframe = merge_rft_ertobs(
+        gendatacsv=args.gendatacsv,
+        obsdir=args.obsdir,
+        welldatefile=args.welldatefile,
+    )
 
     if not dframe.empty:
         dframe.to_csv(args.output, index=False)
